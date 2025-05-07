@@ -1,0 +1,9 @@
+pandas==2.2.2
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.25.1
+langdetect==1.0.9
+deep-translator==1.11.4
+spacy==3.7.6
+scikit-learn==1.5.2
+numpy==1.26.4
+openpyxl==3.1.5
