@@ -1,30 +1,59 @@
 import pandas as pd
+import numpy as np
 import re
-from fuzzywuzzy import fuzz
 import uuid
+import logging
 from langdetect import detect
 from deep_translator import GoogleTranslator
-import numpy as np
+from fuzzywuzzy import fuzz
 from collections import Counter
-import logging
 import spacy
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import DBSCAN
+from sentence_transformers import SentenceTransformer
+import hdbscan
+from multiprocessing import Pool
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Initialize translator and NLP
+# Initialize tools
 translator = GoogleTranslator(source='auto', target='en')
 nlp = spacy.load('en_core_web_sm')
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Function to clean text
+# Attribute hierarchy
+ATTRIBUTE_HIERARCHY = {
+    'Material': ['Fill Material', 'Cover Material', 'Fabric', 'Leather', 'Metal'],
+    'Size': ['Length', 'Width', 'Height', 'Diameter'],
+    'Style': ['Design', 'Pattern', 'Shape', 'Finish']
+}
+
+# Predefined 16 categories
+INITIAL_CATEGORIES = {
+    'Size': ['size', 'length', 'width', 'height', 'grandeur', 'talla', 'taglia', 'größe'],
+    'Color': ['color', 'colour', 'couleur', 'shade', 'tint', 'hue'],
+    'Style': ['style', 'design', 'type', 'finish', 'pattern'],
+    'Material': ['material', 'fabric', 'leather', 'metal', 'wood'],
+    'Quantity': ['quantity', 'pack', 'number', 'count', 'amount'],
+    'Shape': ['shape', 'form', 'cut'],
+    'Fit': ['fit', 'sleeve', 'inseam', 'waist'],
+    'Product Accessories': ['buckle', 'chain', 'strap', 'lens', 'hardware'],
+    'Design Features': ['texture', 'sheen', 'framing', 'border'],
+    'Functional Components': ['function', 'backset', 'capacity', 'weight'],
+    'Packaging Options': ['package', 'bundle', 'set', 'box'],
+    'Customization Choices': ['engraving', 'monogram', 'personalization'],
+    'Condition': ['condition', 'status'],
+    'Location': ['ships from', 'ship to', 'location'],
+    'Specific Product Details': ['model', 'version', 'edition'],
+    'Other Attributes': ['scent', 'flavor', 'fragrance']
+}
+
+# Clean text
 def clean_text(text):
     if pd.isna(text):
         return ''
     return re.sub(r'[^\w\s]', '', str(text).lower()).strip()
 
-# Function to detect and translate non-English titles
+# Translate non-English titles
 def translate_to_english(text):
     try:
         lang = detect(text)
@@ -36,60 +65,54 @@ def translate_to_english(text):
         logging.warning(f"Translation failed for '{text}': {e}")
         return text, 'unknown'
 
-# Build dynamic taxonomy with NLP
+# Build dynamic taxonomy
 def build_dynamic_taxonomy(titles):
-    taxonomy = {
-        'Size': ['size', 'sizes', 's-m-l', 's-m-l-xl', 'grandeur', 'taille', 'talla', 'taglia', 'größe', 'us size', 'uk size', 'eu size', 'ring size', 'necklace size', 'bracelet size', 'waist size', 'shoe size', 'clothing size', 'bedding size', 'plant size', 'canvas size', 'art size', 'pot size', 'rug size', 'watch size', 'sleeve length', 'inseam', 'height', 'width', 'length', 'depth', 'diameter', 'tamaño', 'strap size', 'neck size'],
-        'Color': ['color', 'colour', 'couleur', 'colore', 'color code', 'primary color', 'secondary color', 'frame color', 'lens color', 'metal color', 'gem color', 'stone color', 'fabric color', 'upholstery color', 'hair color', 'emitting color', 'color1', 'color2', 'gold color', 'combined color'],
-        'Material': ['material', 'fabric', 'leather', 'metal', 'wood', 'gemstone', 'stone', 'glass', 'composition', 'upholstery', 'material/color'],
-        'Style': ['style', 'type', 'design', 'pattern', 'fit', 'finish', 'sheen', 'texture', 'shape', 'diamond shape', 'cut', 'model', 'version', 'edition', 'collection', 'category', 'framing options', 'border options', 'engraving options', 'product type', 'production method', 'door knob shape'],
-        'Quantity': ['quantity', 'pack size', 'bundle size', 'select quantity', 'count', 'amount', 'number', 'servings', 'package quantity', 'select a sock size', 'select compression strength'],
-        'Scent': ['scent', 'fragrance', 'flavor', 'flavour', 'scent profile', 'perfume'],
-        'Hardware': ['hardware', 'buckle', 'buckle color', 'clasp', 'clasp option', 'hook', 'hook size', 'chain', 'chain type', 'chain length', 'rope', 'rope length', 'hanger', 'hanging option'],
-        'Letter': ['letter', 'letra', 'initial', 'monogram', 'name', 'font'],
-        'Other': ['condition', 'ships from', 'ship from', 'origin', 'season', 'function', 'feature', 'option', 'options', 'add-on', 'add ons', 'personalization', 'personalisation', 'engraving', 'status', 'packaging', 'packaging type', 'warranty', 'purpose', 'preference', 'location']
-    }
-    
+    taxonomy = INITIAL_CATEGORIES.copy()
     cleaned_titles = [clean_text(title) for title in titles if pd.notna(title)]
     title_counts = Counter(cleaned_titles)
     common_terms = [term for term, count in title_counts.most_common(50) if len(term) > 2]
     
     for term in common_terms:
-        matched = False
-        for attr, variants in taxonomy.items():
-            if any(fuzz.ratio(term, v) > 85 for v in variants):
-                matched = True
-                break
+        matched = any(fuzz.ratio(term, v) > 85 for attrs in taxonomy.values() for v in attrs)
         if not matched:
             doc = nlp(term)
-            if any(token.lemma_ in ['shape', 'form'] for token in doc):
+            if any(token.lemma_ in ['size', 'length', 'width', 'height'] for token in doc):
+                taxonomy['Size'].append(term)
+            elif any(token.lemma_ in ['color', 'shade', 'tint'] for token in doc):
+                taxonomy['Color'].append(term)
+            elif any(token.lemma_ in ['style', 'type', 'design'] for token in doc):
                 taxonomy['Style'].append(term)
-            elif 'co2' in term.lower():
-                taxonomy['Other'].append(term)
             else:
-                taxonomy['Other'].append(term)
+                taxonomy['Other Attributes'].append(term)
     
     inverse_taxonomy = {v.lower(): k for k, vs in taxonomy.items() for v in vs}
     return taxonomy, inverse_taxonomy
 
-# Normalize variant title with NLP
+# Normalize variant title with hierarchy
 def normalize_variant_title(title, inverse_taxonomy, taxonomy):
     if pd.isna(title):
-        return 'Unknown', 'Other', None, str(uuid.uuid4()), 'Missing title'
+        return 'Unknown', 'Unknown', None, None, str(uuid.uuid4()), 'Missing title'
     
     original_title = title
     translated_title, lang = translate_to_english(title)
     title_clean = clean_text(translated_title)
     
-    primary_attr = 'Other'
+    primary_attr = 'Unknown'
     secondary_attr = None
+    hierarchical_attr = None
     group_id = str(uuid.uuid4())
     notes = f"Language: {lang}"
     
+    # Direct match
     if title_clean in inverse_taxonomy:
         primary_attr = inverse_taxonomy[title_clean]
-        return original_title, primary_attr, secondary_attr, group_id, notes
+        for parent, children in ATTRIBUTE_HIERARCHY.items():
+            if primary_attr in children:
+                hierarchical_attr = parent
+                break
+        return original_title, primary_attr, secondary_attr, hierarchical_attr, group_id, notes
     
+    # Fuzzy matching
     best_score = 0
     best_match = None
     for taxonomy_title in inverse_taxonomy.keys():
@@ -100,86 +123,124 @@ def normalize_variant_title(title, inverse_taxonomy, taxonomy):
     
     if best_match:
         primary_attr = inverse_taxonomy[best_match]
-        if 'color' in best_match.lower() and primary_attr != 'Color':
-            secondary_attr = 'Color'
-            notes += f"; Fuzzy match: {best_match} (score: {best_score})"
-        elif 'size' in best_match.lower() and primary_attr != 'Size':
-            secondary_attr = 'Size'
-            notes += f"; Fuzzy match: {best_match} (score: {best_score})"
-        return original_title, primary_attr, secondary_attr, group_id, notes
+        for parent, children in ATTRIBUTE_HIERARCHY.items():
+            if primary_attr in children:
+                hierarchical_attr = parent
+                break
+        notes += f"; Fuzzy match: {best_match} (score: {best_score})"
+        return original_title, primary_attr, secondary_attr, hierarchical_attr, group_id, notes
     
-    regex_patterns = {
-        'Size': r'\bsize\b|\bheight\b|\bwidth\b|\blength\b|\bdepth\b|\bdiameter\b|\bs-m-l\b|\bxs\b|\bs\b|\bm\b|\bl\b|\bxl\b',
-        'Color': r'\bcolor\b|\bcolour\b|\bshade\b|\btint\b|\bblack\b|\bwhite\b|\bblue\b|\bred\b|\bgreen\b',
-        'Material': r'\bmaterial\b|\bfabric\b|\bleather\b|\bmetal\b|\bwood\b|\bcotton\b|\bplastic\b',
-        'Style': r'\bstyle\b|\btype\b|\bdesign\b|\bpattern\b|\bfit\b|\bshape\b|\bslim\b|\bregular\b',
-        'Quantity': r'\bquantity\b|\bpack\b|\bbundle\b|\bcount\b|\bnumber\b|\bpair\b',
-        'Scent': r'\bscent\b|\bfragrance\b|\bflavor\b|\bflavour\b|\bperfume\b',
-        'Hardware': r'\bhardware\b|\bbuckle\b|\bclasp\b|\bhook\b|\bchain\b|\brope\b',
-        'Letter': r'\bletter\b|\bletra\b|\binitial\b|\bmonogram\b|\bname\b|\bfont\b'
+    # NLP and regex patterns
+    patterns = {
+        'Size': r'\bsize\b|\blength\b|\bwidth\b|\bheight\b|\bgrandeur\b|\btalla\b',
+        'Color': r'\bcolor\b|\bcolour\b|\bcouleur\b|\bshade\b|\btint\b',
+        'Style': r'\bstyle\b|\btype\b|\bdesign\b|\bfinish\b',
+        'Material': r'\bmaterial\b|\bfabric\b|\bleather\b|\bmetal\b',
+        'Quantity': r'\bquantity\b|\bpack\b|\bnumber\b|\bcount\b'
     }
     
     doc = nlp(title_clean)
-    for attr, pattern in regex_patterns.items():
+    words = title_clean.split()
+    for attr, pattern in patterns.items():
         if re.search(pattern, title_clean) or any(token.lemma_ in pattern.split('|') for token in doc):
             primary_attr = attr
+            if len(words) > 1:
+                secondary_attr = ' '.join(words[:-1])
+            for parent, children in ATTRIBUTE_HIERARCHY.items():
+                if primary_attr in children:
+                    hierarchical_attr = parent
+                    break
             break
     else:
-        notes += "; Ambiguous title, requires manual review"
+        notes += "; Unmatched, assigned to generic group"
     
-    if 'color' in title_clean and primary_attr != 'Color':
-        secondary_attr = 'Color'
-    elif 'size' in title_clean and primary_attr != 'Size':
-        secondary_attr = 'Size'
-    elif 'shape' in title_clean and primary_attr != 'Style':
-        secondary_attr = 'Shape'
-    
-    return original_title, primary_attr, secondary_attr, group_id, notes
+    return original_title, primary_attr, secondary_attr, hierarchical_attr, group_id, notes
 
-# Group similar titles with clustering
-def group_similar_titles(titles, threshold=0.2):
-    cleaned_titles = [clean_text(title) for title in titles]
-    vectorizer = TfidfVectorizer().fit_transform(cleaned_titles)
-    clustering = DBSCAN(eps=threshold, min_samples=2, metric='cosine').fit(vectorizer)
-    
+# Generate embeddings
+def generate_embeddings(titles, batch_size=500):
+    embeddings = []
+    for i in range(0, len(titles), batch_size):
+        batch = titles[i:i+batch_size]
+        batch_embeddings = model.encode(batch, show_progress_bar=False)
+        embeddings.append(batch_embeddings)
+    return np.vstack(embeddings)
+
+# Cluster titles with generic group naming
+def cluster_titles(titles, embeddings):
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=5, metric='euclidean')
+    labels = clusterer.fit_predict(embeddings)
     title_to_group = {}
-    for idx, label in enumerate(clustering.labels_):
-        if label != -1:
-            group_id = str(uuid.uuid4()) if label == 0 else f"group_{label}"
-            title_to_group[titles[idx]] = group_id
-        else:
-            title_to_group[titles[idx]] = str(uuid.uuid4())
+    group_names = [
+        "Product Accessories", "Design Features", "Functional Components",
+        "Packaging Options", "Customization Choices", "Specific Product Details"
+    ]
     
+    for idx, (title, label) in enumerate(zip(titles, labels)):
+        if label != -1:
+            group_id = f"{group_names[label % len(group_names)]}_{uuid.uuid4().hex[:8]}"
+        else:
+            group_id = f"GenericGroup_{uuid.uuid4().hex[:8]}"
+        title_to_group[title] = group_id
     return title_to_group
 
-# Process full batch
-def process_full_batch(input_file, pilot_size=1500, output_file='full_batch.xlsx'):
+# Process a single title
+def process_title(row, inverse_taxonomy, taxonomy, existing_groups):
+    title = row['variant_title']
+    original, primary, secondary, hierarchical, temp_group_id, notes = normalize_variant_title(title, inverse_taxonomy, taxonomy)
+    
+    group_id = temp_group_id
+    title_clean = clean_text(title)
+    for gid, titles in existing_groups.items():
+        for t in titles:
+            if fuzz.token_sort_ratio(title_clean, clean_text(t)) > 90:
+                group_id = gid
+                break
+        if group_id != temp_group_id:
+            break
+    
+    return {
+        'Original_Title': original,
+        'Translated_Title': translate_to_english(title)[0],
+        'Normalized_Title': clean_text(title),
+        'Primary_Attribute': primary,
+        'Secondary_Attribute': secondary,
+        'Hierarchical_Attribute': hierarchical,
+        'Group_ID': group_id,
+        'Notes': notes
+    }
+
+def process_full_batch(variant_data_file, pilot_output, output_file):
     logging.info("Milestone 2: Processing Full Batch...")
-    df = pd.read_excel(input_file).iloc[pilot_size:]
     
+    # Load data
+    df = pd.read_excel(variant_data_file)
+    pilot_df = pd.read_excel(pilot_output)
+    
+    # Build dynamic taxonomy
     taxonomy, inverse_taxonomy = build_dynamic_taxonomy(df['variant_title'])
-    unique_titles = df['variant_title'].dropna().unique()
-    title_to_group = group_similar_titles(unique_titles)
     
-    results = []
-    for title in df['variant_title']:
-        original, primary, secondary, temp_group_id, notes = normalize_variant_title(title, inverse_taxonomy, taxonomy)
-        group_id = title_to_group.get(original, temp_group_id)
-        results.append({
-            'Original_Title': original,
-            'Normalized_Title': primary,
-            'Primary_Attribute': primary,
-            'Secondary_Attribute': secondary,
-            'Group_ID': group_id,
-            'Notes': notes
-        })
+    # Get existing groups from pilot
+    existing_groups = pilot_df.groupby('Group_ID')['Original_Title'].apply(list).to_dict()
     
+    # Process titles in parallel
+    with Pool() as pool:
+        results = pool.starmap(process_title, [(row, inverse_taxonomy, taxonomy, existing_groups) for _, row in df.iterrows()])
+    
+    # Create output DataFrame
     result_df = pd.DataFrame(results)
+    
+    # Cluster unmatched titles
+    unmatched = result_df[result_df['Group_ID'].str.startswith('GenericGroup_')]
+    if not unmatched.empty:
+        unique_titles = unmatched['Original_Title'].dropna().unique()
+        embeddings = generate_embeddings(unique_titles)
+        title_to_group = cluster_titles(unique_titles, embeddings)
+        result_df.loc[result_df['Original_Title'].isin(title_to_group), 'Group_ID'] = result_df['Original_Title'].map(title_to_group)
+    
+    # Save output
     result_df.to_excel(output_file, index=False)
     logging.info(f"Full batch processed. Output saved to {output_file}")
     return result_df
 
-# Main execution
 if __name__ == "__main__":
-    input_file = 'variant_data.xlsx'
-    process_full_batch(input_file)
+    process_full_batch("variant_data.xlsx", "output/milestone1_pilot_output.xlsx", "output/milestone2_full_output.xlsx")
