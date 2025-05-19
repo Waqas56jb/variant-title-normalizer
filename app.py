@@ -7,12 +7,18 @@ import psutil
 from tqdm import tqdm
 from joblib import Parallel, delayed
 import logging
+from spellchecker import SpellChecker
+import sys
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Download NLTK data for tokenization
+# Download NLTK data for tokenization and POS tagging
 nltk.download('punkt', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+
+# Initialize spell checker
+spell_checker = SpellChecker(language='en')
 
 # Enhanced regex patterns for attribute extraction
 REGEX_PATTERNS = {
@@ -228,11 +234,12 @@ TAXONOMY = {
 
 def preprocess_title(title: str) -> str:
     """
-    Preprocess the title by trimming whitespace, normalizing dashes, and applying title case.
-    
+    Preprocess the title by trimming whitespace, normalizing dashes, applying title case, removing verbs and prepositions,
+    and correcting spelling.
+
     Args:
         title (str): The raw variant title.
-    
+
     Returns:
         str: The preprocessed title.
     """
@@ -241,16 +248,33 @@ def preprocess_title(title: str) -> str:
     title = re.sub(r'\s+', ' ', title.strip())
     title = re.sub(r'[–—]', '-', title)
     title = re.sub(r'\[(.*?)\]', r'\1', title)
-    title = ' '.join(word.capitalize() for word in title.split() if word)
-    return title
+
+    # Tokenize and tag parts of speech
+    tokens = nltk.word_tokenize(title)
+    pos_tags = nltk.pos_tag(tokens)
+
+    # Filter out verbs (VB, VBD, VBG, VBN, VBP, VBZ) and prepositions (IN)
+    filtered_tokens = [word for word, pos in pos_tags if pos not in ['VB', 'VBD', 'VBG', 'VBN', 'VBP', 'VBZ', 'IN']]
+
+    # Reconstruct title
+    title = ' '.join(filtered_tokens)
+
+    # Correct spelling and unify 'colour'/'couleur' to 'color'
+    corrected_title = ' '.join(spell_checker.correction(word) if word.lower() in ['colour', 'couleur'] else word for word in title.split())
+    corrected_title = re.sub(r'\b(colour|couleur)\b', 'color', corrected_title, flags=re.IGNORECASE)
+
+    # Apply title case to remaining words
+    corrected_title = ' '.join(word.capitalize() for word in corrected_title.split() if word)
+
+    return corrected_title
 
 def normalize_text(text: str) -> str:
     """
     Clean text for fuzzy matching.
-    
+
     Args:
         text (str): The text to normalize.
-    
+
     Returns:
         str: The normalized text.
     """
@@ -263,12 +287,12 @@ def normalize_text(text: str) -> str:
 def extract_normalized_value(title: str, primary_attr: str, secondary_attr: str) -> str:
     """
     Extract the normalized value based on attributes.
-    
+
     Args:
         title (str): The preprocessed title.
         primary_attr (str): The Primary Attribute.
         secondary_attr (str): The Secondary Attribute.
-    
+
     Returns:
         str: The normalized value.
     """
@@ -310,12 +334,12 @@ def extract_normalized_value(title: str, primary_attr: str, secondary_attr: str)
 def match_to_taxonomy(title: str, taxonomy: dict, regex_patterns: dict) -> tuple[str, str]:
     """
     Match the title to the taxonomy with precise attribute segmentation.
-    
+
     Args:
         title (str): The preprocessed title.
         taxonomy (dict): The taxonomy dictionary.
         regex_patterns (dict): The regex patterns.
-    
+
     Returns:
         tuple[str, str]: Primary Attribute and Secondary Attribute.
     """
@@ -378,18 +402,22 @@ def match_to_taxonomy(title: str, taxonomy: dict, regex_patterns: dict) -> tuple
         primary_attr = "Color"
         secondary_attr = "Finish"
 
+    # Flag as ambiguous if no clear match
+    if not primary_attr and not any(matched_attrs):
+        return "Ambiguous", ""
+
     return primary_attr, secondary_attr
 
 def process_title(row: pd.Series, row_id: int, taxonomy: dict, regex_patterns: dict) -> dict:
     """
     Process a single title.
-    
+
     Args:
         row (pd.Series): The row of the DataFrame.
         row_id (int): The row ID.
         taxonomy (dict): The taxonomy dictionary.
         regex_patterns (dict): The regex patterns.
-    
+
     Returns:
         dict: The processed title data.
     """
@@ -401,7 +429,8 @@ def process_title(row: pd.Series, row_id: int, taxonomy: dict, regex_patterns: d
             "Original Title": title,
             "Normalized Value": "",
             "Primary Attribute": "",
-            "Secondary Attribute": ""
+            "Secondary Attribute": "",
+            "Is Ambiguous": True
         }
 
     preprocessed_title = preprocess_title(title)
@@ -411,27 +440,30 @@ def process_title(row: pd.Series, row_id: int, taxonomy: dict, regex_patterns: d
             "Original Title": title,
             "Normalized Value": "",
             "Primary Attribute": "",
-            "Secondary Attribute": ""
+            "Secondary Attribute": "",
+            "Is Ambiguous": True
         }
 
     primary_attr, secondary_attr = match_to_taxonomy(preprocessed_title, taxonomy, regex_patterns)
     normalized_value = extract_normalized_value(preprocessed_title, primary_attr, secondary_attr)
+    is_ambiguous = primary_attr == "Ambiguous"
 
     return {
         "Original Title": title,
         "Normalized Value": normalized_value,
         "Primary Attribute": primary_attr,
-        "Secondary Attribute": secondary_attr
+        "Secondary Attribute": secondary_attr,
+        "Is Ambiguous": is_ambiguous
     }
 
 def milestone2_simple_batch(input_file: str, output_file: str) -> pd.DataFrame:
     """
     Process all variant titles for Milestone 2.
-    
+
     Args:
         input_file (str): Path to the input Excel file.
         output_file (str): Path to the output Excel file.
-    
+
     Returns:
         pd.DataFrame: The processed DataFrame.
     """
@@ -490,11 +522,11 @@ if __name__ == "__main__":
     It processes all 11,522 titles from the input file and outputs the required fields.
 
     Requirements:
-    - Install dependencies: pip install pandas fuzzywuzzy python-Levenshtein nltk openpyxl psutil tqdm joblib
+    - Install dependencies: pip install pandas fuzzywuzzy python-Levenshtein nltk openpyxl psutil tqdm joblib pyspellchecker
     - Input file:
       - 'variant_data.xlsx': Full dataset with 11,522 titles and a 'variant_title' column.
     - Output file:
-      - 'milestone2_normalized_titles_simple.xlsx': Contains Original Title, Normalized Value, Primary Attribute, and Secondary Attribute.
+      - 'milestone2_normalized_titles_simple.xlsx': Contains Original Title, Normalized Value, Primary Attribute, Secondary Attribute, and Is Ambiguous.
 
     To run:
     1. Ensure the input file is in the same directory as this script.

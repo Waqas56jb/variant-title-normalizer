@@ -8,3 +8,5 @@ joblib>=1.2.0
 langdetect>=1.0.9
 googletrans==4.0.0-rc1
 translate>=3.6.0
+spacy>=3.5.0
+pyspellchecker>=0.7.0
